@@ -127,6 +127,25 @@ fn high_risk_profiles_require_earlyoom_unless_overridden() {
         .code(3)
         .stderr(predicate::str::contains("earlyoom is required"));
 
+    let mut python_module = Command::cargo_bin("infer-guard").unwrap();
+    python_module.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    python_module.args([
+        "run",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+        "--",
+        "python3",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--help",
+    ]);
+    python_module
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("earlyoom is required"));
+
     let mut allowed = Command::cargo_bin("infer-guard").unwrap();
     allowed.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
     allowed.args([

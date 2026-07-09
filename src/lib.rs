@@ -666,24 +666,43 @@ fn detect_profile(command: &[String]) -> Option<Profile> {
         .and_then(|name| name.to_str())
         .unwrap_or(first);
     let name = name.strip_suffix(".real").unwrap_or(name);
+    let python_module = is_python_executable(name);
 
     if matches!(name, "vllm" | "api_server" | "gpu_worker")
-        || (matches!(name, "python" | "python3") && command.iter().any(|arg| arg == "vllm"))
+        || (python_module && command_runs_module(command, "vllm"))
     {
         return Some(Profile::Vllm);
     }
     if matches!(name, "llama-server" | "llama-cli" | "llama-bench") {
         return Some(Profile::LlamaCpp);
     }
-    if name == "sglang"
-        || (matches!(name, "python" | "python3") && command.iter().any(|arg| arg == "sglang"))
-    {
+    if name == "sglang" || (python_module && command_runs_module(command, "sglang")) {
         return Some(Profile::Sglang);
     }
     if name == "trtllm-serve" || first.contains("TensorRT-LLM") {
         return Some(Profile::Trtllm);
     }
     None
+}
+
+fn is_python_executable(name: &str) -> bool {
+    if name == "python" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix("python") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+}
+
+fn command_runs_module(command: &[String], module: &str) -> bool {
+    command.windows(2).any(|window| {
+        window[0] == "-m"
+            && (window[1] == module
+                || window[1]
+                    .strip_prefix(module)
+                    .is_some_and(|suffix| suffix.starts_with('.')))
+    })
 }
 
 fn command_strings(command: &[OsString]) -> Vec<String> {
@@ -1175,6 +1194,18 @@ SwapFree:          789 kB
             Some(Profile::Vllm)
         );
         assert_eq!(
+            detect_profile(&["python3.11".into(), "-m".into(), "vllm".into()]),
+            Some(Profile::Vllm)
+        );
+        assert_eq!(
+            detect_profile(&[
+                "python3".into(),
+                "-m".into(),
+                "vllm.entrypoints.openai.api_server".into()
+            ]),
+            Some(Profile::Vllm)
+        );
+        assert_eq!(
             detect_profile(&["/tmp/vllm.real".into()]),
             Some(Profile::Vllm)
         );
@@ -1196,7 +1227,15 @@ SwapFree:          789 kB
             Some(Profile::Sglang)
         );
         assert_eq!(
+            detect_profile(&["python3".into(), "-m".into(), "sglang.launch_server".into()]),
+            Some(Profile::Sglang)
+        );
+        assert_eq!(
             detect_profile(&["python3".into(), "-m".into(), "other".into()]),
+            None
+        );
+        assert_eq!(
+            detect_profile(&["python3".into(), "script.py".into(), "vllm".into()]),
             None
         );
         assert_eq!(
