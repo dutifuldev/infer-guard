@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
@@ -11,6 +12,30 @@ fn meminfo(mem_available_kb: u64, swap_free_kb: u64) -> String {
     format!(
         "MemTotal: 999999999 kB\nMemAvailable: {mem_available_kb} kB\nSwapFree: {swap_free_kb} kB\n"
     )
+}
+
+fn wait_for_file(path: &Path) {
+    for _ in 0..100 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+fn process_exists(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+fn wait_for_process_exit(pid: u32) {
+    for _ in 0..100 {
+        if !process_exists(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("process {pid} is still alive");
 }
 
 #[test]
@@ -402,6 +427,53 @@ fn run_escalates_to_sigkill_when_child_ignores_sigterm() {
         elapsed.as_secs() < 10,
         "guard should escalate instead of waiting for the child sleep"
     );
+}
+
+#[test]
+fn run_cleans_process_group_when_guard_receives_term() {
+    let dir = tempdir().unwrap();
+    let child_pid_path = dir.path().join("child.pid");
+    let script = format!(
+        "echo $$ > {}; trap '' TERM; sleep 20",
+        child_pid_path.display()
+    );
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.args([
+        "run",
+        "--profile",
+        "generic",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "1s",
+        "--term-grace",
+        "100ms",
+        "--allow-no-earlyoom",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    let mut guard = cmd.spawn().unwrap();
+    wait_for_file(&child_pid_path);
+    let child_pid: u32 = fs::read_to_string(&child_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(guard.id().to_string())
+        .assert()
+        .success();
+    let status = guard.wait().unwrap();
+
+    assert_eq!(status.code(), Some(143));
+    wait_for_process_exit(child_pid);
 }
 
 #[test]

@@ -6,8 +6,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -15,6 +19,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::sys::statvfs::statvfs;
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
 const DEFAULT_TOOLS: &[&str] = &[
     "vllm",
@@ -323,6 +328,7 @@ fn run_guard(args: RunArgs) -> Result<i32> {
         return Ok(4);
     }
 
+    let shutdown_signal = shutdown_signal_flag()?;
     let mut child = spawn_process_group(&args.command)?;
     let pgid = child.id() as i32;
     logger.log(
@@ -332,6 +338,17 @@ fn run_guard(args: RunArgs) -> Result<i32> {
     )?;
 
     loop {
+        if let Some(signal) = pending_shutdown_signal(&shutdown_signal) {
+            return kill_for_parent_signal(
+                &mut child,
+                pgid,
+                term_grace,
+                &mut logger,
+                &command,
+                signal,
+            );
+        }
+
         if let Some(status) = child.try_wait()? {
             let code = status_to_code(status);
             logger.log(
@@ -377,7 +394,7 @@ fn run_guard(args: RunArgs) -> Result<i32> {
             );
         }
 
-        thread::sleep(poll);
+        sleep_until_poll_or_signal(poll, &shutdown_signal);
     }
 }
 
@@ -401,6 +418,26 @@ fn kill_for_pressure(
     terminate_process_group(pgid, term_grace)?;
     let _ = child.wait();
     Ok(137)
+}
+
+fn kill_for_parent_signal(
+    child: &mut Child,
+    pgid: i32,
+    term_grace: Duration,
+    logger: &mut EventLogger,
+    command: &[String],
+    signal: i32,
+) -> Result<i32> {
+    logger.log(
+        Event::new("parent_signal_kill", "run")
+            .with_command(command.to_vec())
+            .with_pid(child.id())
+            .with_detail(format!("received signal {signal}")),
+    )?;
+    eprintln!("received signal {signal}; terminating process group {pgid}");
+    terminate_process_group(pgid, term_grace)?;
+    let _ = child.wait();
+    Ok(128 + signal)
 }
 
 fn install_shims(args: InstallShimsArgs) -> Result<i32> {
@@ -502,6 +539,37 @@ fn spawn_process_group(command: &[OsString]) -> io::Result<Child> {
     child.args(&command[1..]);
     child.process_group(0);
     child.spawn()
+}
+
+fn shutdown_signal_flag() -> Result<Arc<AtomicUsize>> {
+    let signal = Arc::new(AtomicUsize::new(0));
+    for signal_number in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
+        signal_hook::flag::register_usize(
+            signal_number,
+            Arc::clone(&signal),
+            signal_number as usize,
+        )
+        .with_context(|| format!("failed to register signal handler for {signal_number}"))?;
+    }
+    Ok(signal)
+}
+
+fn pending_shutdown_signal(signal: &AtomicUsize) -> Option<i32> {
+    match signal.load(Ordering::SeqCst) {
+        0 => None,
+        signal_number => Some(signal_number as i32),
+    }
+}
+
+fn sleep_until_poll_or_signal(poll: Duration, signal: &AtomicUsize) {
+    let deadline = Instant::now() + poll;
+    while pending_shutdown_signal(signal).is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
 }
 
 // The integration suite covers TERM/KILL behavior with real child processes.
