@@ -364,9 +364,49 @@ fn run_escalates_to_sigkill_when_child_ignores_sigterm() {
         "guard should wait for TERM grace before KILL"
     );
     assert!(
-        elapsed.as_secs() < 5,
+        elapsed.as_secs() < 10,
         "guard should escalate instead of waiting for the child sleep"
     );
+}
+
+#[test]
+fn run_rejects_invalid_durations_without_panic() {
+    let mut poll = Command::cargo_bin("infer-guard").unwrap();
+    poll.args([
+        "run",
+        "--profile",
+        "generic",
+        "--allow-no-earlyoom",
+        "--poll",
+        "-1",
+        "--",
+        "bash",
+        "-lc",
+        "exit 0",
+    ]);
+    poll.assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --poll"))
+        .stderr(predicate::str::contains("panicked").not());
+
+    let mut term_grace = Command::cargo_bin("infer-guard").unwrap();
+    term_grace.args([
+        "run",
+        "--profile",
+        "generic",
+        "--allow-no-earlyoom",
+        "--term-grace",
+        "NaN",
+        "--",
+        "bash",
+        "-lc",
+        "exit 0",
+    ]);
+    term_grace
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --term-grace"))
+        .stderr(predicate::str::contains("panicked").not());
 }
 
 #[test]

@@ -624,24 +624,29 @@ fn parse_duration(input: &str) -> Result<Duration> {
         let millis: f64 = number
             .parse()
             .with_context(|| format!("invalid millisecond duration: {number:?}"))?;
-        return Ok(Duration::from_millis(millis.round() as u64));
+        return duration_from_secs(millis / 1000.0);
     }
     if let Some(number) = trimmed.strip_suffix('s') {
         let seconds: f64 = number
             .parse()
             .with_context(|| format!("invalid second duration: {number:?}"))?;
-        return Ok(Duration::from_secs_f64(seconds));
+        return duration_from_secs(seconds);
     }
     if let Some(number) = trimmed.strip_suffix('m') {
         let minutes: f64 = number
             .parse()
             .with_context(|| format!("invalid minute duration: {number:?}"))?;
-        return Ok(Duration::from_secs_f64(minutes * 60.0));
+        return duration_from_secs(minutes * 60.0);
     }
     let seconds: f64 = trimmed
         .parse()
         .with_context(|| format!("invalid duration: {trimmed:?}"))?;
-    Ok(Duration::from_secs_f64(seconds))
+    duration_from_secs(seconds)
+}
+
+fn duration_from_secs(seconds: f64) -> Result<Duration> {
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| anyhow!("duration must be a non-negative finite number"))
 }
 
 fn effective_profile(profile: Profile, command: &[String]) -> Profile {
@@ -1135,6 +1140,12 @@ mod tests {
         assert_eq!(parse_duration("0.5").unwrap(), Duration::from_millis(500));
         assert!(parse_duration("").is_err());
         assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("-1").is_err());
+        assert!(parse_duration("NaN").is_err());
+        assert!(parse_duration("inf").is_err());
+        assert!(parse_duration("-1ms").is_err());
+        assert!(parse_duration("NaNs").is_err());
+        assert!(parse_duration("infm").is_err());
     }
 
     #[test]
