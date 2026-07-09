@@ -412,6 +412,49 @@ fn path_shim_resolves_real_binary_without_recursing() {
 }
 
 #[test]
+fn path_shim_treats_generated_defaults_as_data() {
+    let dir = tempdir().unwrap();
+    let shim_dir = dir.path().join("shims");
+    let real_dir = dir.path().join("real");
+    let sentinel = dir.path().join("sentinel");
+    let payload = format!("$(touch {})", sentinel.display());
+    fs::create_dir_all(&real_dir).unwrap();
+    let real = real_dir.join("fake-vllm");
+    fs::write(&real, "#!/usr/bin/env bash\necho should-not-run\n").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    install
+        .arg("install-shims")
+        .arg("--bin-dir")
+        .arg(&shim_dir)
+        .args(["--tool", "fake-vllm", "--min-mem"])
+        .arg(&payload)
+        .args(["--min-swap", "0"]);
+    install.assert().success();
+
+    let shim = shim_dir.join("fake-vllm");
+    let mut run = Command::new(&shim);
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    run.env(
+        "PATH",
+        format!(
+            "{}:{}:{system_path}",
+            shim_dir.display(),
+            real_dir.display()
+        ),
+    );
+    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --min-mem"));
+    assert!(
+        !sentinel.exists(),
+        "generated shim default executed as shell code"
+    );
+}
+
+#[test]
 fn install_default_shims_and_refuse_unmanaged_collision() {
     let dir = tempdir().unwrap();
     let shim_dir = dir.path().join("shims");
@@ -494,6 +537,35 @@ fn wrap_and_unwrap_round_trip() {
         .assert()
         .success()
         .stdout(predicate::str::contains("wrapped-real restored"));
+}
+
+#[test]
+fn absolute_wrapper_treats_generated_defaults_as_data() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("vllm");
+    let sentinel = dir.path().join("sentinel");
+    let payload = format!("$(touch {})", sentinel.display());
+    fs::write(&target, "#!/usr/bin/env bash\necho should-not-run\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.arg("wrap")
+        .arg(&target)
+        .args(["--min-mem"])
+        .arg(&payload)
+        .args(["--min-swap", "0"]);
+    wrap.assert().success();
+
+    let mut guarded = Command::new(&target);
+    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --min-mem"));
+    assert!(
+        !sentinel.exists(),
+        "generated wrapper default executed as shell code"
+    );
 }
 
 #[test]

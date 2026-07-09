@@ -910,9 +910,11 @@ set -euo pipefail
 tool={tool_q}
 real_env={env_q}
 default_infer_guard={bin_q}
+default_min_mem={min_mem_q}
+default_min_swap={min_swap_q}
 infer_guard="${{INFER_GUARD_BIN:-$default_infer_guard}}"
-min_mem="${{INFER_GUARD_MIN_MEM:-{min_mem}}}"
-min_swap="${{INFER_GUARD_MIN_SWAP:-{min_swap}}}"
+min_mem="${{INFER_GUARD_MIN_MEM:-$default_min_mem}}"
+min_swap="${{INFER_GUARD_MIN_SWAP:-$default_min_swap}}"
 profile="${{INFER_GUARD_PROFILE:-auto}}"
 real="${{!real_env:-}}"
 
@@ -951,6 +953,8 @@ exec "$infer_guard" "${{args[@]}}" -- "$real" "$@"
         tool_q = sh_quote(tool),
         env_q = sh_quote(&env_name),
         bin_q = sh_quote(&infer_guard_bin.display().to_string()),
+        min_mem_q = sh_quote(min_mem),
+        min_swap_q = sh_quote(min_swap),
     )
 }
 
@@ -961,9 +965,11 @@ fn absolute_wrapper_script(infer_guard_bin: &Path, min_mem: &str, min_swap: &str
 set -euo pipefail
 
 default_infer_guard={bin_q}
+default_min_mem={min_mem_q}
+default_min_swap={min_swap_q}
 infer_guard="${{INFER_GUARD_BIN:-$default_infer_guard}}"
-min_mem="${{INFER_GUARD_MIN_MEM:-{min_mem}}}"
-min_swap="${{INFER_GUARD_MIN_SWAP:-{min_swap}}}"
+min_mem="${{INFER_GUARD_MIN_MEM:-$default_min_mem}}"
+min_swap="${{INFER_GUARD_MIN_SWAP:-$default_min_swap}}"
 profile="${{INFER_GUARD_PROFILE:-auto}}"
 real="${{BASH_SOURCE[0]}}.real"
 
@@ -978,6 +984,8 @@ fi
 exec "$infer_guard" "${{args[@]}}" -- "$real" "$@"
 "#,
         bin_q = sh_quote(&infer_guard_bin.display().to_string()),
+        min_mem_q = sh_quote(min_mem),
+        min_swap_q = sh_quote(min_swap),
     )
 }
 
