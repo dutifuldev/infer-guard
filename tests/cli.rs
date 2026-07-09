@@ -14,14 +14,14 @@ fn meminfo(mem_available_kb: u64, swap_free_kb: u64) -> String {
     )
 }
 
-fn wait_for_file(path: &Path) {
-    for _ in 0..100 {
+fn wait_for_file(path: &Path) -> bool {
+    for _ in 0..500 {
         if path.exists() {
-            return;
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    panic!("timed out waiting for {}", path.display());
+    false
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -559,13 +559,16 @@ fn run_cleans_process_group_when_monitoring_fails_after_spawn() {
 #[test]
 fn run_cleans_process_group_when_guard_receives_term() {
     let dir = tempdir().unwrap();
+    let meminfo_path = dir.path().join("meminfo");
     let child_pid_path = dir.path().join("child.pid");
+    fs::write(&meminfo_path, meminfo(10 * 1024 * 1024, 1024)).unwrap();
     let script = format!(
         "echo $$ > {}; trap '' TERM; sleep 20",
         child_pid_path.display()
     );
 
     let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -585,7 +588,14 @@ fn run_cleans_process_group_when_guard_receives_term() {
         &script,
     ]);
     let mut guard = cmd.spawn().unwrap();
-    wait_for_file(&child_pid_path);
+    if !wait_for_file(&child_pid_path) {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(guard.id().to_string())
+            .status();
+        let _ = guard.wait();
+        panic!("timed out waiting for {}", child_pid_path.display());
+    }
     let child_pid: u32 = fs::read_to_string(&child_pid_path)
         .unwrap()
         .trim()
