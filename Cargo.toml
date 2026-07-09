@@ -1,0 +1,22 @@
+[package]
+name = "infer-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "Guard local LLM inference launches from OOM failures"
+repository = "https://github.com/dutifuldev/infer-guard"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+nix = { version = "0.30.1", features = ["fs", "process", "signal", "term"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+signal-hook = "0.3.18"
+
+[dev-dependencies]
+assert_cmd = "2.1.1"
+mutants = "0.0.3"
+predicates = "3.1.3"
+tempfile = "3.24.0"
