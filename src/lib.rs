@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::statvfs::statvfs;
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,8 @@ const DEFAULT_MIN_MEM: &str = "24G";
 const DEFAULT_MIN_SWAP: &str = "4G";
 const DEFAULT_POLL: &str = "1s";
 const DEFAULT_TERM_GRACE: &str = "10s";
+const PROCESS_GROUP_SETTLE: Duration = Duration::from_millis(100);
+const PROCESS_GROUP_KILL_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -368,6 +370,17 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                     .with_pid(child.id())
                     .with_exit(code),
             );
+            let group_remaining = process_group_exists(pgid);
+            if group_remaining {
+                log_after_spawn(
+                    &mut logger,
+                    Event::new("process_group_cleanup", "run")
+                        .with_command(command.clone())
+                        .with_pid(child.id())
+                        .with_detail("leader exited while process group still had running members"),
+                );
+            }
+            terminate_process_group(&mut child, pgid, term_grace)?;
             return Ok(code);
         }
 
@@ -423,6 +436,17 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                     .with_pid(child.id())
                     .with_exit(code),
             );
+            let group_remaining = process_group_exists(pgid);
+            if group_remaining {
+                log_after_spawn(
+                    &mut logger,
+                    Event::new("process_group_cleanup", "run")
+                        .with_command(command.clone())
+                        .with_pid(child.id())
+                        .with_detail("leader exited while process group still had running members"),
+                );
+            }
+            terminate_process_group(&mut child, pgid, term_grace)?;
             return Ok(code);
         }
     }
@@ -498,6 +522,7 @@ fn install_shims(args: InstallShimsArgs) -> Result<i32> {
     let infer_guard_bin = current_infer_guard_bin()?;
 
     for tool in tools {
+        validate_tool_name(&tool)?;
         let path = bin_dir.join(&tool);
         if path_entry_exists(&path)? && !is_managed_path_shim(&path)? && !args.force {
             bail!("refusing to replace non-managed file: {}", path.display());
@@ -514,6 +539,7 @@ fn install_shims(args: InstallShimsArgs) -> Result<i32> {
 fn uninstall_shims(args: UninstallShimsArgs) -> Result<i32> {
     let bin_dir = args.bin_dir.unwrap_or(default_bin_dir()?);
     for tool in selected_tools(&args.tools) {
+        validate_tool_name(&tool)?;
         let path = bin_dir.join(&tool);
         if is_managed_path_shim(&path)? {
             fs::remove_file(&path)
@@ -641,17 +667,48 @@ fn sleep_until_poll_signal_or_child(
 // Sub-millisecond deadline boundary mutations here are noisy for cargo-mutants.
 #[cfg_attr(test, mutants::skip)]
 fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -> Result<()> {
-    let pid = Pid::from_raw(pgid);
-    let _ = killpg(pid, Signal::SIGTERM);
+    let _ = signal_process_group(pgid, Signal::SIGTERM);
     let started = Instant::now();
-    while started.elapsed() < term_grace {
+    let mut seen_group = false;
+    loop {
+        let _ = child.try_wait();
+        let group_exists = process_group_exists(pgid);
+        if group_exists {
+            seen_group = true;
+            let _ = signal_process_group(pgid, Signal::SIGTERM);
+        } else if seen_group {
+            return Ok(());
+        }
+
+        let elapsed = started.elapsed();
+        if seen_group && elapsed >= term_grace {
+            break;
+        }
+        if !seen_group && elapsed >= PROCESS_GROUP_SETTLE {
+            break;
+        }
+
+        let deadline = if seen_group {
+            term_grace
+        } else {
+            PROCESS_GROUP_SETTLE
+        };
+        let remaining = deadline.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            continue;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+
+    let _ = signal_process_group(pgid, Signal::SIGKILL);
+    let kill_started = Instant::now();
+    while kill_started.elapsed() < PROCESS_GROUP_KILL_WAIT {
         let _ = child.try_wait();
         if !process_group_exists(pgid) {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(20));
     }
-    let _ = killpg(pid, Signal::SIGKILL);
     let _ = child.try_wait();
     Ok(())
 }
@@ -659,11 +716,71 @@ fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -
 // Thin /proc adapter; exercised through process-group integration tests.
 #[cfg_attr(test, mutants::skip)]
 fn process_group_exists(pgid: i32) -> bool {
-    match killpg(Pid::from_raw(pgid), None) {
-        Ok(()) => true,
-        Err(Errno::ESRCH) => false,
-        Err(_) => true,
+    match kill(Pid::from_raw(-pgid), None) {
+        Ok(()) => return true,
+        Err(Errno::ESRCH) => {}
+        Err(_) => return true,
     }
+    process_group_member_pids(pgid)
+        .map(|pids| !pids.is_empty())
+        .unwrap_or(false)
+}
+
+fn signal_process_group(pgid: i32, signal: Signal) -> nix::Result<()> {
+    let group_result = kill(Pid::from_raw(-pgid), signal);
+    let mut signaled_member = false;
+    if let Ok(pids) = process_group_member_pids(pgid) {
+        for pid in pids {
+            if kill(Pid::from_raw(pid), signal).is_ok() {
+                signaled_member = true;
+            }
+        }
+    }
+    if group_result.is_ok() || signaled_member {
+        Ok(())
+    } else {
+        group_result
+    }
+}
+
+fn process_group_member_pids(pgid: i32) -> Result<Vec<i32>> {
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            continue;
+        };
+        if read_process_group_id(&entry.path()).ok() == Some(pgid) {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+fn read_process_group_id(proc_dir: &Path) -> Result<i32> {
+    parse_process_group_id(&fs::read_to_string(proc_dir.join("stat"))?)
+}
+
+fn parse_process_group_id(stat: &str) -> Result<i32> {
+    let comm_end = stat
+        .rfind(')')
+        .ok_or_else(|| anyhow!("missing process command in stat"))?;
+    let mut fields = stat[comm_end + 1..].split_whitespace();
+    let _state = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing process state in stat"))?;
+    let _ppid = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing parent pid in stat"))?;
+    fields
+        .next()
+        .ok_or_else(|| anyhow!("missing process group id in stat"))?
+        .parse()
+        .context("invalid process group id in stat")
 }
 
 fn status_to_code(status: ExitStatus) -> i32 {
@@ -1031,6 +1148,18 @@ fn selected_tools(tools: &[String]) -> Vec<String> {
             .collect();
     }
     tools.to_vec()
+}
+
+fn validate_tool_name(tool: &str) -> Result<()> {
+    let path = Path::new(tool);
+    if tool.is_empty()
+        || path.is_absolute()
+        || path.components().count() != 1
+        || path.file_name().and_then(|name| name.to_str()) != Some(tool)
+    {
+        bail!("tool name must be a bare executable name: {tool}");
+    }
+    Ok(())
 }
 
 fn default_bin_dir() -> Result<PathBuf> {
@@ -1505,14 +1634,26 @@ SwapFree:          789 kB
             "Name:\tvllm\nVmRSS:\t42 kB\nState:\tS\n",
         )
         .unwrap();
+        fs::write(dir.path().join("stat"), "123 (vllm worker) S 1 456 456 0\n").unwrap();
         assert_eq!(read_cmdline(dir.path()).unwrap(), "vllm serve");
         assert_eq!(read_rss_bytes(dir.path()).unwrap(), Some(42 * 1024));
+        assert_eq!(read_process_group_id(dir.path()).unwrap(), 456);
+        assert_eq!(
+            parse_process_group_id("123 (name with spaces) S 1 789 789 0").unwrap(),
+            789
+        );
     }
 
     #[test]
     fn misc_helpers_cover_boundaries() {
         assert_eq!(selected_tools(&[]), DEFAULT_TOOLS);
         assert_eq!(selected_tools(&["custom".to_string()]), vec!["custom"]);
+        assert!(validate_tool_name("vllm").is_ok());
+        assert!(validate_tool_name("llama-server").is_ok());
+        assert!(validate_tool_name("").is_err());
+        assert!(validate_tool_name("../vllm").is_err());
+        assert!(validate_tool_name("/tmp/vllm").is_err());
+        assert!(validate_tool_name(".").is_err());
         assert!(disk_available(Path::new(".")).unwrap() > 1024 * 1024 * 1024);
         let default_bin = default_bin_dir().unwrap();
         assert!(default_bin.ends_with(".local/bin"));

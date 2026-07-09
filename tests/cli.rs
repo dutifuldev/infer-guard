@@ -512,6 +512,45 @@ fn run_kills_remaining_group_members_after_leader_exits() {
 }
 
 #[test]
+fn run_cleans_background_group_after_leader_exits() {
+    let dir = tempdir().unwrap();
+    let background_pid_path = dir.path().join("background.pid");
+    let ready_path = dir.path().join("background.ready");
+    let script = format!(
+        "(exec >/dev/null 2>&1 < /dev/null; trap '' TERM; echo $BASHPID > {}; touch {}; while true; do sleep 1; done) & while [ ! -f {} ]; do sleep 0.01; done; exit 0",
+        background_pid_path.display(),
+        ready_path.display(),
+        ready_path.display()
+    );
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.args([
+        "run",
+        "--profile",
+        "generic",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+        "--term-grace",
+        "100ms",
+        "--allow-no-earlyoom",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    cmd.assert().success();
+
+    let background_pid: u32 = fs::read_to_string(&background_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_for_process_exit(background_pid);
+}
+
+#[test]
 fn run_cleans_process_group_when_monitoring_fails_after_spawn() {
     let dir = tempdir().unwrap();
     let meminfo_path = dir.path().join("meminfo");
@@ -933,6 +972,62 @@ fn install_refuses_dangling_symlink_without_force() {
             .file_type()
             .is_symlink()
     );
+}
+
+#[test]
+fn install_and_uninstall_reject_path_like_tool_names() {
+    let dir = tempdir().unwrap();
+    let shim_dir = dir.path().join("shims");
+    let escaped = dir.path().join("escape");
+
+    let mut relative = Command::cargo_bin("infer-guard").unwrap();
+    relative.args([
+        "install-shims",
+        "--bin-dir",
+        shim_dir.to_str().unwrap(),
+        "--tool",
+        "../escape",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    relative
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("bare executable name"));
+    assert!(!escaped.exists());
+
+    let mut absolute = Command::cargo_bin("infer-guard").unwrap();
+    absolute.args([
+        "install-shims",
+        "--bin-dir",
+        shim_dir.to_str().unwrap(),
+        "--tool",
+        escaped.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    absolute
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("bare executable name"));
+    assert!(!escaped.exists());
+
+    let mut uninstall = Command::cargo_bin("infer-guard").unwrap();
+    uninstall.args([
+        "uninstall-shims",
+        "--bin-dir",
+        shim_dir.to_str().unwrap(),
+        "--tool",
+        "../escape",
+    ]);
+    uninstall
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("bare executable name"));
 }
 
 #[test]
