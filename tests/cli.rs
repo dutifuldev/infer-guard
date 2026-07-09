@@ -540,6 +540,32 @@ fn wrap_and_unwrap_round_trip() {
 }
 
 #[test]
+fn wrapped_high_risk_tool_still_requires_earlyoom() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("vllm");
+    fs::write(&target, "#!/usr/bin/env bash\necho should-not-run\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.args([
+        "wrap",
+        target.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    wrap.assert().success();
+
+    let mut guarded = Command::new(&target);
+    guarded.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    guarded
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("earlyoom is required"));
+}
+
+#[test]
 fn absolute_wrapper_treats_generated_defaults_as_data() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("vllm");

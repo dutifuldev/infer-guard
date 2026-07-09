@@ -657,6 +657,7 @@ fn detect_profile(command: &[String]) -> Option<Profile> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(first);
+    let name = name.strip_suffix(".real").unwrap_or(name);
 
     if matches!(name, "vllm" | "api_server" | "gpu_worker")
         || (matches!(name, "python" | "python3") && command.iter().any(|arg| arg == "vllm"))
@@ -1157,6 +1158,10 @@ SwapFree:          789 kB
         assert_eq!(detect_profile(&["gpu_worker".into()]), Some(Profile::Vllm));
         assert_eq!(
             detect_profile(&["python".into(), "-m".into(), "vllm".into()]),
+            Some(Profile::Vllm)
+        );
+        assert_eq!(
+            detect_profile(&["/tmp/vllm.real".into()]),
             Some(Profile::Vllm)
         );
         assert_eq!(
