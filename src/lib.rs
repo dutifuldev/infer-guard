@@ -805,7 +805,6 @@ fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -
         let group_exists = process_group_exists(pgid);
         if group_exists {
             seen_group = true;
-            let _ = signal_process_group(pgid, Signal::SIGTERM);
         } else if seen_group {
             return Ok(());
         }
@@ -814,16 +813,19 @@ fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -
         if seen_group && elapsed >= term_grace {
             break;
         }
-        if !seen_group && elapsed >= PROCESS_GROUP_SETTLE {
-            break;
+        if !seen_group {
+            if elapsed >= PROCESS_GROUP_SETTLE {
+                return Ok(());
+            }
+            thread::sleep(
+                PROCESS_GROUP_SETTLE
+                    .saturating_sub(elapsed)
+                    .min(Duration::from_millis(20)),
+            );
+            continue;
         }
 
-        let deadline = if seen_group {
-            term_grace
-        } else {
-            PROCESS_GROUP_SETTLE
-        };
-        let remaining = deadline.saturating_sub(elapsed);
+        let remaining = term_grace.saturating_sub(elapsed);
         if remaining.is_zero() {
             continue;
         }
@@ -858,6 +860,10 @@ fn process_group_exists(pgid: i32) -> bool {
 
 fn signal_process_group(pgid: i32, signal: Signal) -> nix::Result<()> {
     let group_result = kill(Pid::from_raw(-pgid), signal);
+    if group_result.is_ok() {
+        return Ok(());
+    }
+
     let mut signaled_member = false;
     if let Ok(pids) = process_group_member_pids(pgid) {
         for pid in pids {
@@ -866,7 +872,7 @@ fn signal_process_group(pgid: i32, signal: Signal) -> nix::Result<()> {
             }
         }
     }
-    if group_result.is_ok() || signaled_member {
+    if signaled_member {
         Ok(())
     } else {
         group_result

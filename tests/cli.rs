@@ -503,6 +503,49 @@ fn run_escalates_to_sigkill_when_child_ignores_sigterm() {
 }
 
 #[test]
+fn run_sends_one_sigterm_during_grace_window() {
+    let dir = tempdir().unwrap();
+    let meminfo_path = dir.path().join("meminfo");
+    let term_log = dir.path().join("terms.log");
+    fs::write(&meminfo_path, meminfo(10 * 1024 * 1024, 1024)).unwrap();
+    let script = format!(
+        "count=0; trap 'count=$((count+1)); echo term:$count >> {}; if [ $count -gt 1 ]; then exit 42; fi; sleep 0.4; exit 0' TERM; printf '{}' > {}; while true; do sleep 1; done",
+        term_log.display(),
+        meminfo(1024, 1024).replace('\n', "\\n"),
+        meminfo_path.display()
+    );
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    cmd.args([
+        "run",
+        "--profile",
+        "generic",
+        "--min-mem",
+        "2M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "50ms",
+        "--term-grace",
+        "1s",
+        "--allow-no-earlyoom",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    let started = Instant::now();
+    cmd.assert().code(137);
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "guard should let the first SIGTERM cleanup run"
+    );
+    assert_eq!(fs::read_to_string(term_log).unwrap(), "term:1\n");
+}
+
+#[test]
 fn run_reaps_cooperative_term_without_waiting_full_grace() {
     let dir = tempdir().unwrap();
     let meminfo_path = dir.path().join("meminfo");
