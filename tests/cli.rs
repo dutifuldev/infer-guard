@@ -645,6 +645,15 @@ fn wrap_and_unwrap_validate_bad_inputs() {
         .code(2)
         .stderr(predicate::str::contains("cannot wrap missing path"));
 
+    let directory = dir.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    let mut wrap_directory = Command::cargo_bin("infer-guard").unwrap();
+    wrap_directory.args(["wrap", directory.to_str().unwrap()]);
+    wrap_directory
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot wrap non-file path"));
+
     let target = dir.path().join("not-executable");
     fs::write(&target, "plain text\n").unwrap();
     let mut wrap_non_executable = Command::cargo_bin("infer-guard").unwrap();

@@ -445,6 +445,9 @@ fn wrap(args: WrapArgs) -> Result<i32> {
         println!("already wrapped: {}", target.display());
         return Ok(0);
     }
+    if !target.is_file() {
+        bail!("cannot wrap non-file path: {}", target.display());
+    }
     if !is_executable(&target)? {
         bail!("cannot wrap non-executable path: {}", target.display());
     }
