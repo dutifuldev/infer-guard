@@ -847,6 +847,62 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
 }
 
 #[test]
+fn install_force_replaces_symlink_without_touching_target() {
+    let dir = tempdir().unwrap();
+    let shim_dir = dir.path().join("shims");
+    let real_dir = dir.path().join("real");
+    fs::create_dir_all(&shim_dir).unwrap();
+    fs::create_dir_all(&real_dir).unwrap();
+
+    let real = real_dir.join("fake-vllm");
+    fs::write(&real, "#!/usr/bin/env bash\necho real-after-force \"$@\"\n").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_real = fs::read_to_string(&real).unwrap();
+
+    let shim = shim_dir.join("fake-vllm");
+    symlink(&real, &shim).unwrap();
+
+    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    install.args([
+        "install-shims",
+        "--force",
+        "--bin-dir",
+        shim_dir.to_str().unwrap(),
+        "--tool",
+        "fake-vllm",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    install.assert().success();
+
+    assert_eq!(fs::read_to_string(&real).unwrap(), original_real);
+    assert!(
+        !fs::symlink_metadata(&shim)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let mut run = Command::new(&shim);
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    run.env(
+        "PATH",
+        format!(
+            "{}:{}:{system_path}",
+            shim_dir.display(),
+            real_dir.display()
+        ),
+    );
+    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.arg("smoke");
+    run.assert()
+        .success()
+        .stdout(predicate::str::contains("real-after-force smoke"));
+}
+
+#[test]
 fn uninstall_shims_does_not_delete_absolute_wrapper() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("vllm");

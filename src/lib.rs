@@ -1073,11 +1073,54 @@ fn file_contains_marker(path: &Path, marker: &str) -> Result<bool> {
 }
 
 fn write_executable(path: &Path, content: &str) -> Result<()> {
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("missing file name for {}", path.display()))?
+        .to_string_lossy();
+
+    for attempt in 0..100 {
+        let tmp = parent.join(format!(
+            ".{file_name}.infer-guard-tmp-{}-{attempt}",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        };
+
+        let result = (|| -> Result<()> {
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", tmp.display()))?;
+            drop(file);
+
+            let mut permissions = fs::metadata(&tmp)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmp, permissions)?;
+            fs::rename(&tmp, path).with_context(|| {
+                format!(
+                    "failed to replace {} with generated executable",
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        return result;
+    }
+
+    bail!(
+        "failed to create temporary executable next to {}",
+        path.display()
+    )
 }
 
 fn real_path_for(path: &Path) -> PathBuf {
