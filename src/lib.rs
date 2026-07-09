@@ -499,7 +499,7 @@ fn install_shims(args: InstallShimsArgs) -> Result<i32> {
 
     for tool in tools {
         let path = bin_dir.join(&tool);
-        if path.exists() && !is_managed_path_shim(&path)? && !args.force {
+        if path_entry_exists(&path)? && !is_managed_path_shim(&path)? && !args.force {
             bail!("refusing to replace non-managed file: {}", path.display());
         }
         write_executable(
@@ -544,7 +544,7 @@ fn wrap(args: WrapArgs) -> Result<i32> {
     }
 
     let real = real_path_for(&target);
-    if real.exists() && !args.force {
+    if path_entry_exists(&real)? && !args.force {
         bail!(
             "refusing to overwrite existing real path: {}",
             real.display()
@@ -571,7 +571,7 @@ fn unwrap(args: UnwrapArgs) -> Result<i32> {
     if !is_managed_absolute_wrapper(&target)? {
         bail!("not an infer-guard managed wrapper: {}", target.display());
     }
-    if !real.exists() {
+    if !path_entry_exists(&real)? {
         bail!("missing real executable: {}", real.display());
     }
     fs::remove_file(&target).with_context(|| format!("failed to remove {}", target.display()))?;
@@ -1070,6 +1070,14 @@ fn file_contains_marker(path: &Path, marker: &str) -> Result<bool> {
     }
     let content = fs::read_to_string(path).unwrap_or_default();
     Ok(content.contains(marker))
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
 }
 
 fn write_executable(path: &Path, content: &str) -> Result<()> {

@@ -903,6 +903,39 @@ fn install_force_replaces_symlink_without_touching_target() {
 }
 
 #[test]
+fn install_refuses_dangling_symlink_without_force() {
+    let dir = tempdir().unwrap();
+    let shim_dir = dir.path().join("shims");
+    fs::create_dir_all(&shim_dir).unwrap();
+
+    let shim = shim_dir.join("fake-vllm");
+    symlink(dir.path().join("missing"), &shim).unwrap();
+
+    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    install.args([
+        "install-shims",
+        "--bin-dir",
+        shim_dir.to_str().unwrap(),
+        "--tool",
+        "fake-vllm",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    install
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("refusing to replace"));
+    assert!(
+        fs::symlink_metadata(&shim)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn uninstall_shims_does_not_delete_absolute_wrapper() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("vllm");
@@ -980,6 +1013,36 @@ fn wrap_and_unwrap_round_trip() {
         .assert()
         .success()
         .stdout(predicate::str::contains("wrapped-real restored"));
+}
+
+#[test]
+fn unwrap_restores_original_symlink_even_if_target_is_missing() {
+    let dir = tempdir().unwrap();
+    let actual = dir.path().join("actual-vllm");
+    let target = dir.path().join("vllm");
+    fs::write(&actual, "#!/usr/bin/env bash\necho actual \"$@\"\n").unwrap();
+    fs::set_permissions(&actual, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&actual, &target).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.args([
+        "wrap",
+        target.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    wrap.assert().success();
+
+    fs::remove_file(&actual).unwrap();
+
+    let mut unwrap = Command::cargo_bin("infer-guard").unwrap();
+    unwrap.args(["unwrap", target.to_str().unwrap()]);
+    unwrap.assert().success();
+
+    assert_eq!(fs::read_link(&target).unwrap(), actual);
+    assert!(!target.with_file_name("vllm.real").exists());
 }
 
 #[test]
@@ -1118,6 +1181,21 @@ fn wrap_refuses_existing_real_path_without_force() {
     fs::write(&target, "#!/usr/bin/env bash\necho target\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(dir.path().join("vllm.real"), "already exists\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.args(["wrap", target.to_str().unwrap()]);
+    cmd.assert()
+        .code(2)
+        .stderr(predicate::str::contains("refusing to overwrite"));
+}
+
+#[test]
+fn wrap_refuses_dangling_real_sidecar_without_force() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("vllm");
+    fs::write(&target, "#!/usr/bin/env bash\necho target\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(dir.path().join("missing"), dir.path().join("vllm.real")).unwrap();
 
     let mut cmd = Command::cargo_bin("infer-guard").unwrap();
     cmd.args(["wrap", target.to_str().unwrap()]);
