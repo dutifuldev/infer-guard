@@ -16,9 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::statvfs::statvfs;
-use nix::unistd::Pid;
+use nix::unistd::{Pid, getpgrp, tcgetpgrp, tcsetpgrp};
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
@@ -335,6 +335,10 @@ fn run_guard(args: RunArgs) -> Result<i32> {
     let shutdown_signal = shutdown_signal_flag()?;
     let mut child = spawn_process_group(&args.command)?;
     let pgid = child.id() as i32;
+    let mut terminal = match TerminalForeground::handoff_to_child(pgid) {
+        Ok(terminal) => terminal,
+        Err(error) => return cleanup_child_after_error(&mut child, pgid, term_grace, None, error),
+    };
     log_after_spawn(
         &mut logger,
         Event::new("launched", "run")
@@ -348,6 +352,7 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                 &mut child,
                 pgid,
                 term_grace,
+                &mut terminal,
                 &mut logger,
                 &command,
                 signal,
@@ -357,7 +362,13 @@ fn run_guard(args: RunArgs) -> Result<i32> {
         let status = match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
-                return cleanup_child_after_error(&mut child, pgid, term_grace, anyhow!(error));
+                return cleanup_child_after_error(
+                    &mut child,
+                    pgid,
+                    term_grace,
+                    terminal,
+                    anyhow!(error),
+                );
             }
         };
         if let Some(status) = status {
@@ -379,13 +390,16 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                         .with_detail("leader exited while process group still had running members"),
                 );
             }
+            restore_terminal(&mut terminal);
             terminate_process_group(&mut child, pgid, term_grace)?;
             return Ok(code);
         }
 
         let mem = match read_meminfo(&meminfo_path) {
             Ok(mem) => mem,
-            Err(error) => return cleanup_child_after_error(&mut child, pgid, term_grace, error),
+            Err(error) => {
+                return cleanup_child_after_error(&mut child, pgid, term_grace, terminal, error);
+            }
         };
         if mem.mem_available_bytes < min_mem_bytes {
             let detail = format!(
@@ -397,10 +411,13 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                 &mut child,
                 pgid,
                 term_grace,
+                &mut terminal,
                 &mut logger,
                 &command,
-                mem,
-                &detail,
+                PressureReason {
+                    mem,
+                    detail: &detail,
+                },
             );
         }
         if mem.swap_free_bytes < min_swap_bytes {
@@ -413,17 +430,26 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                 &mut child,
                 pgid,
                 term_grace,
+                &mut terminal,
                 &mut logger,
                 &command,
-                mem,
-                &detail,
+                PressureReason {
+                    mem,
+                    detail: &detail,
+                },
             );
         }
 
         let status = match sleep_until_poll_signal_or_child(poll, &shutdown_signal, &mut child) {
             Ok(status) => status,
             Err(error) => {
-                return cleanup_child_after_error(&mut child, pgid, term_grace, anyhow!(error));
+                return cleanup_child_after_error(
+                    &mut child,
+                    pgid,
+                    term_grace,
+                    terminal,
+                    anyhow!(error),
+                );
             }
         };
         if let Some(status) = status {
@@ -445,6 +471,7 @@ fn run_guard(args: RunArgs) -> Result<i32> {
                         .with_detail("leader exited while process group still had running members"),
                 );
             }
+            restore_terminal(&mut terminal);
             terminate_process_group(&mut child, pgid, term_grace)?;
             return Ok(code);
         }
@@ -455,33 +482,44 @@ fn kill_for_pressure(
     child: &mut Child,
     pgid: i32,
     term_grace: Duration,
+    terminal: &mut Option<TerminalForeground>,
     logger: &mut EventLogger,
     command: &[String],
-    mem: MemInfo,
-    detail: &str,
+    pressure: PressureReason<'_>,
 ) -> Result<i32> {
+    restore_terminal(terminal);
     log_after_spawn(
         logger,
         Event::new("memory_pressure_kill", "run")
             .with_command(command.to_vec())
             .with_pid(child.id())
-            .with_mem(mem)
-            .with_detail(detail),
+            .with_mem(pressure.mem)
+            .with_detail(pressure.detail),
     );
-    eprintln!("memory pressure: {detail}; terminating process group {pgid}");
+    eprintln!(
+        "memory pressure: {}; terminating process group {pgid}",
+        pressure.detail
+    );
     terminate_process_group(child, pgid, term_grace)?;
     let _ = child.wait();
     Ok(137)
+}
+
+struct PressureReason<'a> {
+    mem: MemInfo,
+    detail: &'a str,
 }
 
 fn kill_for_parent_signal(
     child: &mut Child,
     pgid: i32,
     term_grace: Duration,
+    terminal: &mut Option<TerminalForeground>,
     logger: &mut EventLogger,
     command: &[String],
     signal: i32,
 ) -> Result<i32> {
+    restore_terminal(terminal);
     log_after_spawn(
         logger,
         Event::new("parent_signal_kill", "run")
@@ -499,8 +537,10 @@ fn cleanup_child_after_error(
     child: &mut Child,
     pgid: i32,
     term_grace: Duration,
+    mut terminal: Option<TerminalForeground>,
     error: anyhow::Error,
 ) -> Result<i32> {
+    restore_terminal(&mut terminal);
     eprintln!("guard error after launch: {error:#}; terminating process group {pgid}");
     let _ = terminate_process_group(child, pgid, term_grace);
     let _ = child.wait();
@@ -618,6 +658,96 @@ fn spawn_process_group(command: &[OsString]) -> io::Result<Child> {
     child.args(&command[1..]);
     child.process_group(0);
     child.spawn()
+}
+
+struct TerminalForeground {
+    tty: File,
+    original_pgrp: Pid,
+    restored: bool,
+}
+
+impl TerminalForeground {
+    fn handoff_to_child(pgid: i32) -> Result<Option<Self>> {
+        let tty = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            Ok(tty) => tty,
+            Err(_) => return Ok(None),
+        };
+        let original_pgrp = match tcgetpgrp(&tty) {
+            Ok(pgrp) => pgrp,
+            Err(Errno::ENOTTY) | Err(Errno::ENXIO) => return Ok(None),
+            Err(error) => bail!("failed to read terminal foreground process group: {error}"),
+        };
+        if original_pgrp != getpgrp() {
+            return Ok(None);
+        }
+
+        let child_pgrp = Pid::from_raw(pgid);
+        if original_pgrp == child_pgrp {
+            return Ok(None);
+        }
+        if !set_foreground_pgrp(&tty, child_pgrp)? {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            tty,
+            original_pgrp,
+            restored: false,
+        }))
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        with_sigttou_blocked(|| tcsetpgrp(&self.tty, self.original_pgrp))
+            .context("failed to restore terminal foreground process group")?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalForeground {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("warning: {error:#}");
+        }
+    }
+}
+
+fn set_foreground_pgrp(tty: &File, pgrp: Pid) -> Result<bool> {
+    let started = Instant::now();
+    loop {
+        match with_sigttou_blocked(|| tcsetpgrp(tty, pgrp)) {
+            Ok(()) => return Ok(true),
+            Err(Errno::ESRCH | Errno::EPERM) if started.elapsed() < PROCESS_GROUP_SETTLE => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(Errno::ESRCH) => return Ok(false),
+            Err(error) => bail!("failed to hand terminal to child process group: {error}"),
+        }
+    }
+}
+
+fn restore_terminal(terminal: &mut Option<TerminalForeground>) {
+    if let Some(terminal) = terminal
+        && let Err(error) = terminal.restore()
+    {
+        eprintln!("warning: {error:#}");
+    }
+}
+
+fn with_sigttou_blocked<T>(operation: impl FnOnce() -> nix::Result<T>) -> nix::Result<T> {
+    let mut blocked = SigSet::empty();
+    blocked.add(Signal::SIGTTOU);
+    let mut previous = SigSet::empty();
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+    let operation_result = operation();
+    let restore_result = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+    match (operation_result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 
 fn shutdown_signal_flag() -> Result<Arc<AtomicUsize>> {

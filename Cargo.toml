@@ -10,7 +10,7 @@ repository = "https://github.com/dutifuldev/infer-guard"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.54", features = ["derive"] }
-nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
+nix = { version = "0.30.1", features = ["fs", "process", "signal", "term"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 signal-hook = "0.3.18"

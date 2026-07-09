@@ -1,8 +1,9 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -36,6 +37,10 @@ fn wait_for_process_exit(pid: u32) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!("process {pid} is still alive");
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[test]
@@ -111,6 +116,74 @@ fn run_returns_signal_exit_code() {
         "kill -TERM $$",
     ]);
     cmd.assert().code(143);
+}
+
+#[test]
+fn run_allows_child_to_read_from_controlling_tty() {
+    if Command::new("script")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
+
+    let bin = Command::cargo_bin("infer-guard")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let guarded = format!(
+        "{} run --profile generic --min-mem 1M --min-swap 0 --allow-no-earlyoom -- bash -lc {}",
+        sh_quote(&bin),
+        sh_quote("read x; echo got:$x")
+    );
+    let mut child = Command::new("script")
+        .args(["-qfec", &guarded, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"from-tty\n")
+        .unwrap();
+    drop(child.stdin.take());
+
+    let started = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "script failed with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.contains("got:from-tty"),
+                "child did not read from the pty\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "timed out waiting for pty read smoke test\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
