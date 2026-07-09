@@ -153,6 +153,7 @@ enum Profile {
     LlamaCpp,
     Sglang,
     Trtllm,
+    Tgi,
     Generic,
 }
 
@@ -160,7 +161,7 @@ impl Profile {
     fn requires_earlyoom(self) -> bool {
         matches!(
             self,
-            Profile::Vllm | Profile::LlamaCpp | Profile::Sglang | Profile::Trtllm
+            Profile::Vllm | Profile::LlamaCpp | Profile::Sglang | Profile::Trtllm | Profile::Tgi
         )
     }
 }
@@ -681,6 +682,9 @@ fn detect_profile(command: &[String]) -> Option<Profile> {
     }
     if name == "trtllm-serve" || first.contains("TensorRT-LLM") {
         return Some(Profile::Trtllm);
+    }
+    if name == "text-generation-launcher" {
+        return Some(Profile::Tgi);
     }
     None
 }
@@ -1246,6 +1250,10 @@ SwapFree:          789 kB
             detect_profile(&["/opt/TensorRT-LLM/server".into()]),
             Some(Profile::Trtllm)
         );
+        assert_eq!(
+            detect_profile(&["text-generation-launcher".into()]),
+            Some(Profile::Tgi)
+        );
         assert_eq!(detect_profile(&["echo".into()]), None);
     }
 
@@ -1255,6 +1263,7 @@ SwapFree:          789 kB
         assert!(Profile::LlamaCpp.requires_earlyoom());
         assert!(Profile::Sglang.requires_earlyoom());
         assert!(Profile::Trtllm.requires_earlyoom());
+        assert!(Profile::Tgi.requires_earlyoom());
         assert!(!Profile::Generic.requires_earlyoom());
         assert_eq!(
             effective_profile(Profile::Generic, &["vllm".into()]),

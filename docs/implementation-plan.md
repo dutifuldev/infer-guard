@@ -53,7 +53,7 @@ infer-guard inspect
 Useful run options:
 
 ```text
---profile vllm|llama-cpp|sglang|trtllm|generic
+--profile vllm|llama-cpp|sglang|trtllm|tgi|generic
 --min-mem 24G
 --min-swap 4G
 --poll 1s
@@ -154,6 +154,7 @@ Initial profiles:
 - `llama-cpp`: `llama-server`, `llama-cli`, `llama-bench`
 - `sglang`: `sglang`, `python -m sglang`
 - `trtllm`: `trtllm-serve`, TensorRT-LLM launchers
+- `tgi`: `text-generation-launcher`
 - `generic`: user-selected fallback with explicit thresholds
 
 Profiles should stay conservative. They are safety defaults, not performance
