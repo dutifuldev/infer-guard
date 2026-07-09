@@ -654,6 +654,69 @@ fn run_rejects_invalid_durations_without_panic() {
 }
 
 #[test]
+fn run_handles_huge_durations_without_panic() {
+    let mut poll = Command::cargo_bin("infer-guard").unwrap();
+    poll.args([
+        "run",
+        "--profile",
+        "generic",
+        "--allow-no-earlyoom",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "10000000000000000000s",
+        "--",
+        "bash",
+        "-lc",
+        "sleep 0.1",
+    ]);
+    poll.assert()
+        .success()
+        .stderr(predicate::str::contains("panicked").not());
+
+    let dir = tempdir().unwrap();
+    let meminfo_path = dir.path().join("meminfo");
+    fs::write(&meminfo_path, meminfo(10 * 1024 * 1024, 1024)).unwrap();
+    let script = format!(
+        "trap 'exit 0' TERM; sleep 0.2; printf '{}' > {}; while true; do sleep 1; done",
+        meminfo(1024, 1024).replace('\n', "\\n"),
+        meminfo_path.display()
+    );
+
+    let mut term_grace = Command::cargo_bin("infer-guard").unwrap();
+    term_grace.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    term_grace.args([
+        "run",
+        "--profile",
+        "generic",
+        "--allow-no-earlyoom",
+        "--min-mem",
+        "2M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "50ms",
+        "--term-grace",
+        "10000000000000000000s",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    let started = Instant::now();
+    term_grace
+        .assert()
+        .code(137)
+        .stderr(predicate::str::contains("panicked").not());
+    assert!(
+        started.elapsed().as_secs_f32() < 1.0,
+        "cooperative child should not wait huge TERM grace"
+    );
+}
+
+#[test]
 fn path_shim_resolves_real_binary_without_recursing() {
     let dir = tempdir().unwrap();
     let shim_dir = dir.path().join("shims");

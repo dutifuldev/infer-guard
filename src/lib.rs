@@ -406,7 +406,23 @@ fn run_guard(args: RunArgs) -> Result<i32> {
             );
         }
 
-        sleep_until_poll_or_signal(poll, &shutdown_signal);
+        let status = match sleep_until_poll_signal_or_child(poll, &shutdown_signal, &mut child) {
+            Ok(status) => status,
+            Err(error) => {
+                return cleanup_child_after_error(&mut child, pgid, term_grace, anyhow!(error));
+            }
+        };
+        if let Some(status) = status {
+            let code = status_to_code(status);
+            log_after_spawn(
+                &mut logger,
+                Event::new("child_exit", "run")
+                    .with_command(command.clone())
+                    .with_pid(child.id())
+                    .with_exit(code),
+            );
+            return Ok(code);
+        }
     }
 }
 
@@ -593,15 +609,27 @@ fn pending_shutdown_signal(signal: &AtomicUsize) -> Option<i32> {
     }
 }
 
-fn sleep_until_poll_or_signal(poll: Duration, signal: &AtomicUsize) {
-    let deadline = Instant::now() + poll;
+fn sleep_until_poll_signal_or_child(
+    poll: Duration,
+    signal: &AtomicUsize,
+    child: &mut Child,
+) -> io::Result<Option<ExitStatus>> {
+    let started = Instant::now();
     while pending_shutdown_signal(signal).is_none() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= poll {
+            break;
+        }
+        let remaining = poll.saturating_sub(elapsed);
         if remaining.is_zero() {
             break;
         }
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
+    Ok(None)
 }
 
 // The integration suite covers TERM/KILL behavior with real child processes.
@@ -610,8 +638,8 @@ fn sleep_until_poll_or_signal(poll: Duration, signal: &AtomicUsize) {
 fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -> Result<()> {
     let pid = Pid::from_raw(pgid);
     let _ = killpg(pid, Signal::SIGTERM);
-    let deadline = Instant::now() + term_grace;
-    while Instant::now() < deadline {
+    let started = Instant::now();
+    while started.elapsed() < term_grace {
         let _ = child.try_wait();
         if !process_group_exists(pgid) {
             return Ok(());
