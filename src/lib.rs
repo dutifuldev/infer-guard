@@ -31,7 +31,9 @@ const DEFAULT_TOOLS: &[&str] = &[
     "trtllm-serve",
     "text-generation-launcher",
 ];
-const MANAGED_MARKER: &str = "infer-guard managed shim";
+const MANAGED_MARKER: &str = "infer-guard managed";
+const PATH_SHIM_MARKER: &str = "infer-guard managed path shim";
+const ABSOLUTE_WRAPPER_MARKER: &str = "infer-guard managed absolute wrapper";
 const DEFAULT_MIN_MEM: &str = "24G";
 const DEFAULT_MIN_SWAP: &str = "4G";
 const DEFAULT_POLL: &str = "1s";
@@ -497,7 +499,7 @@ fn install_shims(args: InstallShimsArgs) -> Result<i32> {
 
     for tool in tools {
         let path = bin_dir.join(&tool);
-        if path.exists() && !is_managed_shim(&path)? && !args.force {
+        if path.exists() && !is_managed_path_shim(&path)? && !args.force {
             bail!("refusing to replace non-managed file: {}", path.display());
         }
         write_executable(
@@ -513,7 +515,7 @@ fn uninstall_shims(args: UninstallShimsArgs) -> Result<i32> {
     let bin_dir = args.bin_dir.unwrap_or(default_bin_dir()?);
     for tool in selected_tools(&args.tools) {
         let path = bin_dir.join(&tool);
-        if is_managed_shim(&path)? {
+        if is_managed_path_shim(&path)? {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
             println!("removed shim: {}", path.display());
@@ -527,9 +529,12 @@ fn wrap(args: WrapArgs) -> Result<i32> {
     if !target.exists() {
         bail!("cannot wrap missing path: {}", target.display());
     }
-    if is_managed_shim(&target)? {
+    if is_managed_absolute_wrapper(&target)? {
         println!("already wrapped: {}", target.display());
         return Ok(0);
+    }
+    if is_managed_path_shim(&target)? {
+        bail!("cannot wrap PATH shim: {}", target.display());
     }
     if !target.is_file() {
         bail!("cannot wrap non-file path: {}", target.display());
@@ -563,7 +568,7 @@ fn wrap(args: WrapArgs) -> Result<i32> {
 fn unwrap(args: UnwrapArgs) -> Result<i32> {
     let target = args.path;
     let real = real_path_for(&target);
-    if !is_managed_shim(&target)? {
+    if !is_managed_absolute_wrapper(&target)? {
         bail!("not an infer-guard managed wrapper: {}", target.display());
     }
     if !real.exists() {
@@ -855,12 +860,19 @@ fn earlyoom_active() -> Result<bool> {
         let value = value.to_string_lossy();
         return Ok(matches!(value.as_ref(), "1" | "true" | "yes" | "on"));
     }
+    let current_pid = std::process::id();
     Ok(process_list()?.iter().any(|process| {
-        process
-            .command
-            .split_whitespace()
-            .any(|part| part.ends_with("earlyoom"))
+        process.pid != current_pid && command_invokes_executable(&process.command, "earlyoom")
     }))
+}
+
+fn command_invokes_executable(command: &str, executable: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        == Some(executable)
 }
 
 // Thin /proc inventory adapter. Higher-level process detection is covered with
@@ -1044,12 +1056,20 @@ fn is_executable(path: &Path) -> Result<bool> {
 // Thin filesystem adapter; path edge cases include equivalent mutations for
 // non-files because read_to_string also returns false-like behavior.
 #[cfg_attr(test, mutants::skip)]
-fn is_managed_shim(path: &Path) -> Result<bool> {
+fn is_managed_path_shim(path: &Path) -> Result<bool> {
+    file_contains_marker(path, PATH_SHIM_MARKER)
+}
+
+fn is_managed_absolute_wrapper(path: &Path) -> Result<bool> {
+    file_contains_marker(path, ABSOLUTE_WRAPPER_MARKER)
+}
+
+fn file_contains_marker(path: &Path, marker: &str) -> Result<bool> {
     if !path.exists() || !path.is_file() {
         return Ok(false);
     }
     let content = fs::read_to_string(path).unwrap_or_default();
-    Ok(content.contains(MANAGED_MARKER))
+    Ok(content.contains(marker))
 }
 
 fn write_executable(path: &Path, content: &str) -> Result<()> {
@@ -1070,7 +1090,7 @@ fn path_shim_script(tool: &str, infer_guard_bin: &Path, min_mem: &str, min_swap:
     let env_name = format!("INFER_GUARD_REAL_{}", env_suffix(tool));
     format!(
         r#"#!/usr/bin/env bash
-# {MANAGED_MARKER}
+# {PATH_SHIM_MARKER}
 set -euo pipefail
 
 tool={tool_q}
@@ -1127,7 +1147,7 @@ exec "$infer_guard" "${{args[@]}}" -- "$real" "$@"
 fn absolute_wrapper_script(infer_guard_bin: &Path, min_mem: &str, min_swap: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
-# {MANAGED_MARKER}
+# {ABSOLUTE_WRAPPER_MARKER}
 set -euo pipefail
 
 default_infer_guard={bin_q}
@@ -1137,7 +1157,7 @@ infer_guard="${{INFER_GUARD_BIN:-$default_infer_guard}}"
 min_mem="${{INFER_GUARD_MIN_MEM:-$default_min_mem}}"
 min_swap="${{INFER_GUARD_MIN_SWAP:-$default_min_swap}}"
 profile="${{INFER_GUARD_PROFILE:-auto}}"
-real="${{BASH_SOURCE[0]}}.real"
+real="$(readlink -f "${{BASH_SOURCE[0]}}").real"
 
 args=(run --profile "$profile" --min-mem "$min_mem" --min-swap "$min_swap")
 if [[ "${{INFER_GUARD_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
@@ -1413,6 +1433,19 @@ SwapFree:          789 kB
     fn command_and_proc_helpers_parse_expected_shapes() {
         let command = command_strings(&[OsString::from("vllm"), OsString::from("serve")]);
         assert_eq!(command, vec!["vllm".to_string(), "serve".to_string()]);
+        assert!(command_invokes_executable(
+            "/usr/bin/earlyoom -m 5",
+            "earlyoom"
+        ));
+        assert!(command_invokes_executable("earlyoom -m 5", "earlyoom"));
+        assert!(!command_invokes_executable(
+            "infer-guard run --require-earlyoom",
+            "earlyoom"
+        ));
+        assert!(!command_invokes_executable(
+            "python3 -c 'earlyoom'",
+            "earlyoom"
+        ));
 
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("cmdline"), b"vllm\0serve\0").unwrap();
@@ -1443,18 +1476,34 @@ SwapFree:          789 kB
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0GiB");
 
         let dir = tempfile::tempdir().unwrap();
-        assert!(!is_managed_shim(&dir.path().join("missing")).unwrap());
-        assert!(!is_managed_shim(dir.path()).unwrap());
+        assert!(!is_managed_path_shim(&dir.path().join("missing")).unwrap());
+        assert!(!is_managed_path_shim(dir.path()).unwrap());
         let shim = dir.path().join("shim");
-        fs::write(&shim, format!("# {MANAGED_MARKER}\n")).unwrap();
-        assert!(is_managed_shim(&shim).unwrap());
+        fs::write(&shim, format!("# {PATH_SHIM_MARKER}\n")).unwrap();
+        assert!(is_managed_path_shim(&shim).unwrap());
+        assert!(!is_managed_absolute_wrapper(&shim).unwrap());
+
+        let wrapper = dir.path().join("wrapper");
+        fs::write(&wrapper, format!("# {ABSOLUTE_WRAPPER_MARKER}\n")).unwrap();
+        assert!(is_managed_absolute_wrapper(&wrapper).unwrap());
+        assert!(!is_managed_path_shim(&wrapper).unwrap());
     }
 
     #[test]
     fn generated_path_shim_has_marker_and_env_escape() {
         let script = path_shim_script("vllm", Path::new("/tmp/infer-guard"), "24G", "4G");
+        assert!(script.contains(PATH_SHIM_MARKER));
         assert!(script.contains(MANAGED_MARKER));
         assert!(script.contains("INFER_GUARD_REAL_VLLM"));
+        assert!(script.contains("INFER_GUARD_ALLOW_NO_EARLYOOM"));
+    }
+
+    #[test]
+    fn generated_absolute_wrapper_has_marker_and_resolves_real_target() {
+        let script = absolute_wrapper_script(Path::new("/tmp/infer-guard"), "24G", "4G");
+        assert!(script.contains(ABSOLUTE_WRAPPER_MARKER));
+        assert!(script.contains("readlink -f"));
+        assert!(script.contains(".real"));
         assert!(script.contains("INFER_GUARD_ALLOW_NO_EARLYOOM"));
     }
 

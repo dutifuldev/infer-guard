@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
@@ -847,6 +847,46 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
 }
 
 #[test]
+fn uninstall_shims_does_not_delete_absolute_wrapper() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("vllm");
+    fs::write(&target, "#!/usr/bin/env bash\necho still-wrapped \"$@\"\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.args([
+        "wrap",
+        target.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    wrap.assert().success();
+
+    let mut uninstall = Command::cargo_bin("infer-guard").unwrap();
+    uninstall.args([
+        "uninstall-shims",
+        "--bin-dir",
+        dir.path().to_str().unwrap(),
+        "--tool",
+        "vllm",
+    ]);
+    uninstall.assert().success();
+
+    assert!(target.exists());
+    assert!(target.with_file_name("vllm.real").exists());
+
+    let mut guarded = Command::new(&target);
+    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded.arg("after-uninstall");
+    guarded
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("still-wrapped after-uninstall"));
+}
+
+#[test]
 fn wrap_and_unwrap_round_trip() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("vllm");
@@ -884,6 +924,41 @@ fn wrap_and_unwrap_round_trip() {
         .assert()
         .success()
         .stdout(predicate::str::contains("wrapped-real restored"));
+}
+
+#[test]
+fn absolute_wrapper_resolves_symlink_to_real_path() {
+    let dir = tempdir().unwrap();
+    let real_dir = dir.path().join("real");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&real_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let target = real_dir.join("vllm");
+    fs::write(&target, "#!/usr/bin/env bash\necho symlink-real \"$@\"\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.args([
+        "wrap",
+        target.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    wrap.assert().success();
+
+    let symlink_path = bin_dir.join("vllm");
+    symlink(&target, &symlink_path).unwrap();
+
+    let mut guarded = Command::new(&symlink_path);
+    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded.arg("via-symlink");
+    guarded
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("symlink-real via-symlink"));
 }
 
 #[test]
