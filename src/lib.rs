@@ -31,7 +31,6 @@ const DEFAULT_TOOLS: &[&str] = &[
     "trtllm-serve",
     "text-generation-launcher",
 ];
-const MANAGED_MARKER: &str = "infer-guard managed";
 const PATH_SHIM_MARKER: &str = "infer-guard managed path shim";
 const ABSOLUTE_WRAPPER_MARKER: &str = "infer-guard managed absolute wrapper";
 const DEFAULT_MIN_MEM: &str = "24G";
@@ -592,7 +591,8 @@ fn wrap(args: WrapArgs) -> Result<i32> {
 }
 
 fn unwrap(args: UnwrapArgs) -> Result<i32> {
-    let target = args.path;
+    let target = fs::canonicalize(&args.path)
+        .with_context(|| format!("failed to resolve {}", args.path.display()))?;
     let real = real_path_for(&target);
     if !is_managed_absolute_wrapper(&target)? {
         bail!("not an infer-guard managed wrapper: {}", target.display());
@@ -1292,7 +1292,7 @@ if [[ -z "$real" ]]; then
     [[ "$dir" == "$shim_dir" ]] && continue
     candidate="$dir/$tool"
     [[ -x "$candidate" && ! -d "$candidate" ]] || continue
-    if grep -q "{MANAGED_MARKER}" "$candidate" 2>/dev/null; then
+    if grep -q "{PATH_SHIM_MARKER}" "$candidate" 2>/dev/null; then
       continue
     fi
     real="$candidate"
@@ -1685,7 +1685,7 @@ SwapFree:          789 kB
     fn generated_path_shim_has_marker_and_env_escape() {
         let script = path_shim_script("vllm", Path::new("/tmp/infer-guard"), "24G", "4G");
         assert!(script.contains(PATH_SHIM_MARKER));
-        assert!(script.contains(MANAGED_MARKER));
+        assert!(script.contains("infer-guard managed"));
         assert!(script.contains("INFER_GUARD_REAL_VLLM"));
         assert!(script.contains("INFER_GUARD_ALLOW_NO_EARLYOOM"));
     }

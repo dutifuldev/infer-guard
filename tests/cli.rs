@@ -798,6 +798,63 @@ fn path_shim_resolves_real_binary_without_recursing() {
 }
 
 #[test]
+fn path_shim_can_run_wrapped_binary_later_in_path() {
+    let dir = tempdir().unwrap();
+    let shim_dir = dir.path().join("shims");
+    let real_dir = dir.path().join("real");
+    fs::create_dir_all(&real_dir).unwrap();
+    let real = real_dir.join("vllm");
+    fs::write(
+        &real,
+        "#!/usr/bin/env bash\necho wrapped-path-real \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.args([
+        "wrap",
+        real.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    wrap.assert().success();
+
+    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    install.args([
+        "install-shims",
+        "--bin-dir",
+        shim_dir.to_str().unwrap(),
+        "--tool",
+        "vllm",
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    install.assert().success();
+
+    let shim = shim_dir.join("vllm");
+    let mut run = Command::new(&shim);
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    run.env(
+        "PATH",
+        format!(
+            "{}:{}:{system_path}",
+            shim_dir.display(),
+            real_dir.display()
+        ),
+    );
+    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.arg("smoke");
+    run.assert()
+        .success()
+        .stdout(predicate::str::contains("wrapped-path-real smoke"));
+}
+
+#[test]
 fn path_shim_treats_generated_defaults_as_data() {
     let dir = tempdir().unwrap();
     let shim_dir = dir.path().join("shims");
@@ -1138,6 +1195,50 @@ fn unwrap_restores_original_symlink_even_if_target_is_missing() {
 
     assert_eq!(fs::read_link(&target).unwrap(), actual);
     assert!(!target.with_file_name("vllm.real").exists());
+}
+
+#[test]
+fn unwrap_symlink_to_wrapper_uses_wrapper_sidecar() {
+    let dir = tempdir().unwrap();
+    let real_dir = dir.path().join("real");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&real_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let target = real_dir.join("vllm");
+    fs::write(&target, "#!/usr/bin/env bash\necho actual \"$@\"\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    wrap.args([
+        "wrap",
+        target.to_str().unwrap(),
+        "--min-mem",
+        "1M",
+        "--min-swap",
+        "0",
+    ]);
+    wrap.assert().success();
+
+    let symlink_path = bin_dir.join("vllm");
+    let unrelated_sidecar = bin_dir.join("vllm.real");
+    symlink(&target, &symlink_path).unwrap();
+    fs::write(&unrelated_sidecar, "unrelated\n").unwrap();
+
+    let mut unwrap = Command::cargo_bin("infer-guard").unwrap();
+    unwrap.args(["unwrap", symlink_path.to_str().unwrap()]);
+    unwrap.assert().success();
+
+    assert_eq!(fs::read_link(&symlink_path).unwrap(), target);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "#!/usr/bin/env bash\necho actual \"$@\"\n"
+    );
+    assert!(!target.with_file_name("vllm.real").exists());
+    assert_eq!(
+        fs::read_to_string(&unrelated_sidecar).unwrap(),
+        "unrelated\n"
+    );
 }
 
 #[test]
