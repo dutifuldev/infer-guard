@@ -430,6 +430,133 @@ fn run_escalates_to_sigkill_when_child_ignores_sigterm() {
 }
 
 #[test]
+fn run_reaps_cooperative_term_without_waiting_full_grace() {
+    let dir = tempdir().unwrap();
+    let meminfo_path = dir.path().join("meminfo");
+    fs::write(&meminfo_path, meminfo(10 * 1024 * 1024, 1024)).unwrap();
+    let script = format!(
+        "trap 'exit 0' TERM; sleep 0.2; printf '{}' > {}; while true; do sleep 1; done",
+        meminfo(1024, 1024).replace('\n', "\\n"),
+        meminfo_path.display()
+    );
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    cmd.args([
+        "run",
+        "--profile",
+        "generic",
+        "--min-mem",
+        "2M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "50ms",
+        "--term-grace",
+        "1500ms",
+        "--allow-no-earlyoom",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    let started = Instant::now();
+    cmd.assert().code(137);
+    assert!(
+        started.elapsed().as_secs_f32() < 1.0,
+        "guard should not wait full grace after the child exits on TERM"
+    );
+}
+
+#[test]
+fn run_kills_remaining_group_members_after_leader_exits() {
+    let dir = tempdir().unwrap();
+    let meminfo_path = dir.path().join("meminfo");
+    let background_pid_path = dir.path().join("background.pid");
+    fs::write(&meminfo_path, meminfo(10 * 1024 * 1024, 1024)).unwrap();
+    let script = format!(
+        "trap 'exit 0' TERM; (trap '' TERM; echo $BASHPID > {}; while true; do sleep 1; done) & sleep 0.2; printf '{}' > {}; while true; do sleep 1; done",
+        background_pid_path.display(),
+        meminfo(1024, 1024).replace('\n', "\\n"),
+        meminfo_path.display()
+    );
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    cmd.args([
+        "run",
+        "--profile",
+        "generic",
+        "--min-mem",
+        "2M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "50ms",
+        "--term-grace",
+        "150ms",
+        "--allow-no-earlyoom",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    cmd.assert().code(137);
+
+    let background_pid: u32 = fs::read_to_string(&background_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_for_process_exit(background_pid);
+}
+
+#[test]
+fn run_cleans_process_group_when_monitoring_fails_after_spawn() {
+    let dir = tempdir().unwrap();
+    let meminfo_path = dir.path().join("meminfo");
+    let child_pid_path = dir.path().join("child.pid");
+    fs::write(&meminfo_path, meminfo(10 * 1024 * 1024, 1024)).unwrap();
+    let script = format!(
+        "echo $$ > {}; rm {}; sleep 20",
+        child_pid_path.display(),
+        meminfo_path.display()
+    );
+
+    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    cmd.args([
+        "run",
+        "--profile",
+        "generic",
+        "--min-mem",
+        "2M",
+        "--min-swap",
+        "0",
+        "--poll",
+        "50ms",
+        "--term-grace",
+        "100ms",
+        "--allow-no-earlyoom",
+        "--",
+        "bash",
+        "-lc",
+        &script,
+    ]);
+    cmd.assert()
+        .code(2)
+        .stderr(predicate::str::contains("guard error after launch"))
+        .stderr(predicate::str::contains("failed to read"));
+
+    let child_pid: u32 = fs::read_to_string(&child_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_for_process_exit(child_pid);
+}
+
+#[test]
 fn run_cleans_process_group_when_guard_receives_term() {
     let dir = tempdir().unwrap();
     let child_pid_path = dir.path().join("child.pid");

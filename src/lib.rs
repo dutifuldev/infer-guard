@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::statvfs::statvfs;
 use nix::unistd::Pid;
@@ -331,11 +332,12 @@ fn run_guard(args: RunArgs) -> Result<i32> {
     let shutdown_signal = shutdown_signal_flag()?;
     let mut child = spawn_process_group(&args.command)?;
     let pgid = child.id() as i32;
-    logger.log(
+    log_after_spawn(
+        &mut logger,
         Event::new("launched", "run")
             .with_command(command.clone())
             .with_pid(child.id()),
-    )?;
+    );
 
     loop {
         if let Some(signal) = pending_shutdown_signal(&shutdown_signal) {
@@ -349,18 +351,28 @@ fn run_guard(args: RunArgs) -> Result<i32> {
             );
         }
 
-        if let Some(status) = child.try_wait()? {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                return cleanup_child_after_error(&mut child, pgid, term_grace, anyhow!(error));
+            }
+        };
+        if let Some(status) = status {
             let code = status_to_code(status);
-            logger.log(
+            log_after_spawn(
+                &mut logger,
                 Event::new("child_exit", "run")
                     .with_command(command.clone())
                     .with_pid(child.id())
                     .with_exit(code),
-            )?;
+            );
             return Ok(code);
         }
 
-        let mem = read_meminfo(&meminfo_path)?;
+        let mem = match read_meminfo(&meminfo_path) {
+            Ok(mem) => mem,
+            Err(error) => return cleanup_child_after_error(&mut child, pgid, term_grace, error),
+        };
         if mem.mem_available_bytes < min_mem_bytes {
             let detail = format!(
                 "MemAvailable {} below floor {}",
@@ -407,15 +419,16 @@ fn kill_for_pressure(
     mem: MemInfo,
     detail: &str,
 ) -> Result<i32> {
-    logger.log(
+    log_after_spawn(
+        logger,
         Event::new("memory_pressure_kill", "run")
             .with_command(command.to_vec())
             .with_pid(child.id())
             .with_mem(mem)
             .with_detail(detail),
-    )?;
+    );
     eprintln!("memory pressure: {detail}; terminating process group {pgid}");
-    terminate_process_group(pgid, term_grace)?;
+    terminate_process_group(child, pgid, term_grace)?;
     let _ = child.wait();
     Ok(137)
 }
@@ -428,16 +441,35 @@ fn kill_for_parent_signal(
     command: &[String],
     signal: i32,
 ) -> Result<i32> {
-    logger.log(
+    log_after_spawn(
+        logger,
         Event::new("parent_signal_kill", "run")
             .with_command(command.to_vec())
             .with_pid(child.id())
             .with_detail(format!("received signal {signal}")),
-    )?;
+    );
     eprintln!("received signal {signal}; terminating process group {pgid}");
-    terminate_process_group(pgid, term_grace)?;
+    terminate_process_group(child, pgid, term_grace)?;
     let _ = child.wait();
     Ok(128 + signal)
+}
+
+fn cleanup_child_after_error(
+    child: &mut Child,
+    pgid: i32,
+    term_grace: Duration,
+    error: anyhow::Error,
+) -> Result<i32> {
+    eprintln!("guard error after launch: {error:#}; terminating process group {pgid}");
+    let _ = terminate_process_group(child, pgid, term_grace);
+    let _ = child.wait();
+    Err(error)
+}
+
+fn log_after_spawn(logger: &mut EventLogger, event: Event) {
+    if let Err(error) = logger.log(event) {
+        eprintln!("warning: failed to write event log after launch: {error:#}");
+    }
 }
 
 fn install_shims(args: InstallShimsArgs) -> Result<i32> {
@@ -575,24 +607,30 @@ fn sleep_until_poll_or_signal(poll: Duration, signal: &AtomicUsize) {
 // The integration suite covers TERM/KILL behavior with real child processes.
 // Sub-millisecond deadline boundary mutations here are noisy for cargo-mutants.
 #[cfg_attr(test, mutants::skip)]
-fn terminate_process_group(pgid: i32, term_grace: Duration) -> Result<()> {
+fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -> Result<()> {
     let pid = Pid::from_raw(pgid);
     let _ = killpg(pid, Signal::SIGTERM);
-    let deadline = std::time::Instant::now() + term_grace;
-    while std::time::Instant::now() < deadline {
-        if !process_exists(pgid) {
+    let deadline = Instant::now() + term_grace;
+    while Instant::now() < deadline {
+        let _ = child.try_wait();
+        if !process_group_exists(pgid) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
     let _ = killpg(pid, Signal::SIGKILL);
+    let _ = child.try_wait();
     Ok(())
 }
 
 // Thin /proc adapter; exercised through process-group integration tests.
 #[cfg_attr(test, mutants::skip)]
-fn process_exists(pid: i32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+fn process_group_exists(pgid: i32) -> bool {
+    match killpg(Pid::from_raw(pgid), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    }
 }
 
 fn status_to_code(status: ExitStatus) -> i32 {
