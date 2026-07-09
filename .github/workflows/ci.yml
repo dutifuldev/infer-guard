@@ -57,5 +57,6 @@ jobs:
       - name: Slophammer
         uses: dutifuldev/slophammer@main
         with:
-          checker: rust
+          checker: rs
           version: ${{ env.SLOPHAMMER_VERSION }}
+          args: check .
