@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 license = "MIT"
 description = "Guard local LLM inference launches from OOM failures"
-repository = "https://github.com/dutifuldev/infer-guard"
+repository = "https://github.com/osolmaz/infer-guard"
 
 [dependencies]
 anyhow = "1.0.100"

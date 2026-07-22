@@ -55,7 +55,7 @@ jobs:
       - name: Slophammer aggregate
         run: slophammer-rs check . --format json
       - name: Slophammer
-        uses: dutifuldev/slophammer@main
+        uses: osolmaz/slophammer@main
         with:
           checker: rs
           version: ${{ env.SLOPHAMMER_VERSION }}
